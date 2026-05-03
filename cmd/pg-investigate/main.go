@@ -8,19 +8,22 @@ import (
 	"github.com/alecthomas/kong"
 	"github.com/fortnox/pg-investigate/internal/collector"
 	"github.com/fortnox/pg-investigate/internal/config"
+	"github.com/fortnox/pg-investigate/internal/kubectl"
 	"github.com/fortnox/pg-investigate/internal/output"
 	"github.com/fortnox/pg-investigate/internal/ssh"
 )
 
 var cli struct {
-	Investigation string `short:"i" required:"" help:"Investigation name"`
-	Time          string `short:"t" required:"" help:"Incident time"`
-	Output        string `short:"o" default:"./investigation" help:"Output dir"`
-	Host          string `name:"host" required:"" help:"SSH target"`
-	Vm            string `name:"vm" required:"" help:"Harvester VM name"`
-	Namespace     string `name:"ns" required:"" help:"Kubernetes namespace"`
-	Insecure      bool   `long:"insecure" help:"Skip SSH host key verification"`
-	PgVersion     string `long:"pg-version" required:"" help:"PostgreSQL version"`
+	Investigation string        `short:"i" required:"" help:"Investigation name"`
+	Time          string        `short:"t" required:"" help:"Incident time"`
+	Output        string        `short:"o" default:"./investigation" help:"Output dir"`
+	Host          string        `name:"host" required:"" help:"SSH target"`
+	Vm            string        `name:"vm" required:"" help:"Harvester VM name"`
+	Namespace     string        `name:"ns" required:"" help:"Kubernetes namespace"`
+	Insecure      bool          `long:"insecure" help:"Skip SSH host key verification"`
+	PgVersion     string        `long:"pg-version" required:"" help:"PostgreSQL version"`
+	Window        time.Duration `long:"window" short:"w" default:"10m" help:"Time window around incident"`
+	DC            string        `long:"dc" required:"" help:"Datacenter (sto1, sto2, sto3)"`
 }
 
 func main() {
@@ -38,11 +41,31 @@ func main() {
 		os.Exit(1)
 	}
 
+	dc, ok := cfg.Datacenters[cli.DC]
+	if !ok {
+		fmt.Printf("Unknown datacenter: %s\n", cli.DC)
+		os.Exit(1)
+	}
+
+	// Get harvester node from VMI
+	fmt.Printf("Getting VMI info for %s...\n", cli.Vm)
+	harvesterNode, err := kubectl.GetVMINode(dc.KubeContext, cli.Vm, cli.Namespace)
+	if err != nil {
+		fmt.Println("Failed to get VMI node:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("VM is on harvester node: %s\n", harvesterNode)
+
 	vars := config.TemplateVars{
-		IncidentTime: incidentTime,
-		Since:        incidentTime.Add(-1 * time.Hour).Format("2006-01-02 15:04:05"),
-		Until:        incidentTime.Add(1 * time.Hour).Format("2006-01-02 15:04:05"),
-		PgVersion:    cli.PgVersion,
+		IncidentTime:  incidentTime,
+		Since:         incidentTime.Add(-cli.Window).Format(time.RFC3339),
+		Until:         incidentTime.Add(cli.Window).Format(time.RFC3339),
+		PgVersion:     cli.PgVersion,
+		Host:          cli.Host,
+		Vm:            cli.Vm,
+		Namespace:     cli.Namespace,
+		KubeContext:   dc.KubeContext,
+		HarvesterNode: harvesterNode,
 	}
 
 	client, err := ssh.Connect(cli.Host, cfg.SSH.User, cli.Insecure)
@@ -69,9 +92,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	c := collector.NewSSH(client, commands, files)
-	if err := c.Collect(outputDir); err != nil {
-		fmt.Println("Collection failed:", err)
+	// Run kubectl commands
+	kubectlCommands, err := cfg.KubectlCommands(vars)
+	if err != nil {
+		fmt.Println("Failed to render kubectl commands:", err)
+		os.Exit(1)
+	}
+
+	if len(kubectlCommands) > 0 {
+		kubectlCollector := collector.NewKubectl(kubectlCommands)
+		if err := kubectlCollector.Collect(outputDir); err != nil {
+			fmt.Println("Kubectl collection failed:", err)
+			os.Exit(1)
+		}
+	}
+
+	// Run SSH commands
+	sshCollector := collector.NewSSH(client, commands, files)
+	if err := sshCollector.Collect(outputDir); err != nil {
+		fmt.Println("SSH collection failed:", err)
 		os.Exit(1)
 	}
 

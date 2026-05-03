@@ -11,8 +11,20 @@ import (
 )
 
 type Config struct {
-	SSH        SSHConfig        `yaml:"ssh"`
-	OpenSearch OpenSearchConfig `yaml:"opensearch"`
+	SSH         SSHConfig           `yaml:"ssh"`
+	OpenSearch  OpenSearchConfig    `yaml:"opensearch"`
+	Kubectl     KubectlConfig       `yaml:"kubectl"`
+	Datacenters map[string]DCConfig `yaml:"datacenters"`
+}
+
+type KubectlConfig struct {
+	VMIQuery string        `yaml:"vmi_query"`
+	Commands []CommandItem `yaml:"commands"`
+}
+
+type DCConfig struct {
+	KubeContext         string   `yaml:"kubecontext"`
+	OpenSearchAddresses []string `yaml:"opensearch_addresses"`
 }
 
 type SSHConfig struct {
@@ -56,10 +68,15 @@ func LoadFrom(path string) (*Config, error) {
 }
 
 type TemplateVars struct {
-	IncidentTime time.Time
-	Since        string
-	Until        string
-	PgVersion    string
+	IncidentTime  time.Time
+	Since         string
+	Until         string
+	PgVersion     string
+	Host          string
+	Vm            string
+	Namespace     string
+	KubeContext   string
+	HarvesterNode string
 }
 
 func (v TemplateVars) Weekday() string {
@@ -101,6 +118,22 @@ func (c *Config) SSHFiles(vars TemplateVars) ([]FileItem, error) {
 		})
 	}
 	return result, nil
+}
+
+func (c *Config) KubectlCommands(vars TemplateVars) ([]CommandItem, error) {
+	var result []CommandItem
+	for _, cmd := range c.Kubectl.Commands {
+		rendered, err := render(cmd.Command, vars)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, CommandItem{Name: cmd.Name, Command: rendered})
+	}
+	return result, nil
+}
+
+func (c *Config) KubectlVMIQuery(vars TemplateVars) (string, error) {
+	return render(c.Kubectl.VMIQuery, vars)
 }
 
 func render(s string, v TemplateVars) (string, error) {
