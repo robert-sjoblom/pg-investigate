@@ -19,4 +19,9 @@ ssh:
 opensearch:
   addresses:
     - https://logs.fnox.se:9200
-  index: "logs-*"
+  user: testuser
+  queries:
+    - name: vm-logs.json
+      index: "logs-*"
+      query: |
+        {"query": {"range": {"@timestamp": {"gte": "{{.Since}}", "lte": "{{.Until}}"}}}}

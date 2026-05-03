@@ -46,8 +46,16 @@ type FileItem struct {
 }
 
 type OpenSearchConfig struct {
-	Addresses []string `yaml:"addresses"`
-	Index     string   `yaml:"index"`
+	Addresses []string    `yaml:"addresses"`
+	User      string      `yaml:"user"`
+	CACert    string      `yaml:"ca_cert"`
+	Queries   []QueryItem `yaml:"queries"`
+}
+
+type QueryItem struct {
+	Name  string `yaml:"name"`
+	Index string `yaml:"index"`
+	Query string `yaml:"query"`
 }
 
 func Load() (*Config, error) {
@@ -134,6 +142,22 @@ func (c *Config) KubectlCommands(vars TemplateVars) ([]CommandItem, error) {
 
 func (c *Config) KubectlVMIQuery(vars TemplateVars) (string, error) {
 	return render(c.Kubectl.VMIQuery, vars)
+}
+
+func (c *Config) OpensearchQueries(vars TemplateVars) ([]QueryItem, error) {
+	var result []QueryItem
+	for _, f := range c.OpenSearch.Queries {
+		rendered, err := render(f.Query, vars)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, QueryItem{
+			Name:  f.Name,
+			Index: f.Index,
+			Query: rendered,
+		})
+	}
+	return result, nil
 }
 
 func render(s string, v TemplateVars) (string, error) {

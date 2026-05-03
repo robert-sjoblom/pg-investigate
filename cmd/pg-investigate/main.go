@@ -9,6 +9,7 @@ import (
 	"github.com/fortnox/pg-investigate/internal/collector"
 	"github.com/fortnox/pg-investigate/internal/config"
 	"github.com/fortnox/pg-investigate/internal/kubectl"
+	"github.com/fortnox/pg-investigate/internal/opensearch"
 	"github.com/fortnox/pg-investigate/internal/output"
 	"github.com/fortnox/pg-investigate/internal/ssh"
 )
@@ -112,6 +113,26 @@ func main() {
 	if err := sshCollector.Collect(outputDir); err != nil {
 		fmt.Println("SSH collection failed:", err)
 		os.Exit(1)
+	}
+
+	if len(cfg.OpenSearch.Addresses) > 0 {
+		osClient, err := opensearch.Connect(cfg.OpenSearch.Addresses, cfg.OpenSearch.User, cfg.OpenSearch.CACert)
+		if err != nil {
+			fmt.Println("OpenSearch connection failed:", err)
+			os.Exit(1)
+		}
+
+		queries, err := cfg.OpensearchQueries(vars)
+		if err != nil {
+			fmt.Println("Failed to render OpenSearch queries:", err)
+			os.Exit(1)
+		}
+
+		osCollector := collector.NewOpenSearch(osClient, queries)
+		if err := osCollector.Collect(outputDir); err != nil {
+			fmt.Println("OpenSearch collection failed:", err)
+			os.Exit(1)
+		}
 	}
 
 	fmt.Println("Done:", outputDir)

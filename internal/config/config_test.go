@@ -54,3 +54,39 @@ func TestSSHFiles(t *testing.T) {
 		t.Errorf("unexpected path: %s", files[0].Path)
 	}
 }
+
+func TestOpensearchQueries(t *testing.T) {
+	cfg, err := LoadFrom("testdata/config.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	vars := TemplateVars{
+		Since: "2026-05-02 03:35:00",
+		Until: "2026-05-02 05:35:00",
+	}
+
+	queries, err := cfg.OpensearchQueries(vars)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(queries) == 0 {
+		t.Fatal("expected queries")
+	}
+
+	if queries[0].Name != "vm-logs.json" {
+		t.Errorf("unexpected name: %s", queries[0].Name)
+	}
+
+	if queries[0].Index != "logs-*" {
+		t.Errorf("unexpected index: %s", queries[0].Index)
+	}
+
+	// Check that Since/Until were substituted
+	expected := `{"query": {"range": {"@timestamp": {"gte": "2026-05-02 03:35:00", "lte": "2026-05-02 05:35:00"}}}}`
+	// Trim whitespace for comparison
+	if queries[0].Query != expected+"\n" {
+		t.Errorf("unexpected query:\ngot:  %q\nwant: %q", queries[0].Query, expected)
+	}
+}
