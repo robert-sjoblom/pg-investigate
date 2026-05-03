@@ -5,8 +5,81 @@ CLI tool to gather diagnostic data for PostgreSQL failover investigations on Har
 ## Usage
 
 ```bash
-pg-investigate --vm <vm-name> --namespace <ns> --time "2026-05-02 04:35:00" --output ./investigation/
+pg-investigate \
+  -i <investigation-name> \
+  -t "2026-05-02 04:35" \
+  --host <ssh-target> \
+  --vm <vm-name> \
+  --ns <namespace> \
+  --pg-version 17 \
+  [--insecure]
 ```
+
+Example:
+```bash
+pg-investigate -i dev-pg-app013 -t "2026-05-02 04:35" \
+  --host dev-pg-app013-db001.sto1.fnox.se \
+  --vm dev-pg-app013-db001 \
+  --ns db-dev001 \
+  --pg-version 17 \
+  --insecure
+```
+
+Output goes to: `investigation/<name>/<date>/<vm>/`
+
+## Configuration
+
+Create `~/.config/pg-investigate/config.yaml`:
+
+```yaml
+ssh:
+  user: your_username
+  commands:
+    - name: dmesg.txt
+      command: "sudo dmesg -T | grep -iE 'error|fail|i/o|ext4|xfs' | tail -100"
+    - name: journalctl-kernel.txt
+      command: "sudo journalctl -k --since '{{.Since}}' --until '{{.Until}}' --no-pager"
+    - name: journalctl-postgres.txt
+      command: "sudo journalctl -u postgresql-{{.PgVersion}} --since '{{.Since}}' --until '{{.Until}}' --no-pager"
+    - name: systemd-timers.txt
+      command: "sudo systemctl list-timers --all"
+    - name: systemd-status-postgres.txt
+      command: "sudo systemctl status postgresql-{{.PgVersion}}"
+  files:
+    - name: postgresql.log
+      path: "/var/lib/pgsql/{{.PgVersion}}/data/log/postgresql-{{.Weekday}}.log"
+    - name: repmgrd.log
+      path: "/var/log/repmgr/repmgrd.log"
+      optional: true
+    - name: repmgrd-rotated.log
+      path: "/var/log/repmgr/repmgrd.log-{{.Date}}.gz"
+      gzip: true
+      optional: true
+
+opensearch:
+  addresses:
+    - https://logs.example.com:9200
+  index: "logs-*"
+```
+
+### Template variables
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `{{.Since}}` | Incident time - 1 hour | `2026-05-02 03:35:05` |
+| `{{.Until}}` | Incident time + 1 hour | `2026-05-02 05:35:05` |
+| `{{.Weekday}}` | Abbreviated weekday | `Sat` |
+| `{{.Date}}` | Date + 1 day (YYYYMMDD) | `20260503` |
+| `{{.PgVersion}}` | PostgreSQL version | `17` |
+
+Note: `{{.Date}}` adds 1 day because log rotation names files by rotation date, not log date.
+
+### File options
+
+| Option | Description |
+|--------|-------------|
+| `gzip: true` | Use `zcat` instead of `cat` |
+| `optional: true` | Skip without error if file doesn't exist |
 
 ## What it collects
 
@@ -54,13 +127,16 @@ pg-investigate/
 
 ## Dependencies
 
-- `github.com/spf13/cobra` - CLI framework
-- `golang.org/x/crypto/ssh` - SSH connections
-- `k8s.io/client-go` - Kubernetes API client
+- `github.com/alecthomas/kong` - CLI framework
+- `golang.org/x/crypto/ssh` - SSH connections via ssh-agent
+- `gopkg.in/yaml.v3` - Config parsing
 
-## Design notes
+## SSH Authentication
 
-1. Each collector implements a common interface
-2. Collectors run concurrently where possible
-3. Output goes to timestamped directory with raw files + summary.md
-4. Errors are collected but don't stop other collectors
+Uses ssh-agent via `SSH_AUTH_SOCK`. Make sure your key is loaded:
+
+```bash
+ssh-add -l
+```
+
+Use `--insecure` to skip host key verification.
