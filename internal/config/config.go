@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"text/template"
 	"time"
 
@@ -111,9 +112,45 @@ func (c *Config) SSHCommands(vars TemplateVars) ([]CommandItem, error) {
 	return result, nil
 }
 
+type weekdayVars struct {
+	TemplateVars
+	overrideWeekday string
+}
+
+func (w weekdayVars) Weekday() string { return w.overrideWeekday }
+
 func (c *Config) SSHFiles(vars TemplateVars) ([]FileItem, error) {
 	var result []FileItem
 	for _, f := range c.SSH.Files {
+		// Files whose path templates against {{.Weekday}} are fanned out
+		// across the incident weekday and (if different) today's weekday,
+		// so investigations run a day after the incident still pull both
+		// logs. Daily-rotated logs (e.g. postgresql-Mon.log) need this.
+		if strings.Contains(f.Path, ".Weekday") {
+			today := time.Now().Format("Mon")
+			weekdays := []string{vars.Weekday()}
+			if today != vars.Weekday() {
+				weekdays = append(weekdays, today)
+			}
+			for i, wd := range weekdays {
+				rendered, err := render(f.Path, weekdayVars{TemplateVars: vars, overrideWeekday: wd})
+				if err != nil {
+					return nil, err
+				}
+				optional := f.Optional
+				if i > 0 {
+					// Today's file may not exist yet on quiet systems.
+					optional = true
+				}
+				result = append(result, FileItem{
+					Name:     nameWithWeekday(f.Name, wd),
+					Path:     rendered,
+					Gzip:     f.Gzip,
+					Optional: optional,
+				})
+			}
+			continue
+		}
 		rendered, err := render(f.Path, vars)
 		if err != nil {
 			return nil, err
@@ -126,6 +163,16 @@ func (c *Config) SSHFiles(vars TemplateVars) ([]FileItem, error) {
 		})
 	}
 	return result, nil
+}
+
+// nameWithWeekday inserts the weekday before the file extension so the two
+// rendered targets don't collide when written to disk:
+// ("postgresql.log", "Mon") -> "postgresql-Mon.log".
+func nameWithWeekday(name, wd string) string {
+	if dot := strings.LastIndex(name, "."); dot > 0 {
+		return name[:dot] + "-" + wd + name[dot:]
+	}
+	return name + "-" + wd
 }
 
 func (c *Config) KubectlCommands(vars TemplateVars) ([]CommandItem, error) {
@@ -160,7 +207,7 @@ func (c *Config) OpensearchQueries(vars TemplateVars) ([]QueryItem, error) {
 	return result, nil
 }
 
-func render(s string, v TemplateVars) (string, error) {
+func render(s string, v any) (string, error) {
 	tmpl, err := template.New("cmd").Parse(s)
 	if err != nil {
 		return "", err
