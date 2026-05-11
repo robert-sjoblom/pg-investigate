@@ -77,15 +77,16 @@ func LoadFrom(path string) (*Config, error) {
 }
 
 type TemplateVars struct {
-	IncidentTime  time.Time
-	Since         string
-	Until         string
-	PgVersion     string
-	Host          string
-	Vm            string
-	Namespace     string
-	KubeContext   string
-	HarvesterNode string
+	IncidentTime   time.Time
+	Since          string
+	Until          string
+	PgVersion      string
+	Host           string
+	Vm             string
+	Namespace      string
+	KubeContext    string
+	HarvesterNode  string
+	HarvesterNodes []string // historical nodes the VM lived on; HarvesterNode is HarvesterNodes[0] when set
 }
 
 func (v TemplateVars) Weekday() string {
@@ -118,6 +119,15 @@ type weekdayVars struct {
 }
 
 func (w weekdayVars) Weekday() string { return w.overrideWeekday }
+
+// harvesterVars shadows TemplateVars.HarvesterNode (a field, not a method)
+// by defining a field of the same name on the outer struct. Go template
+// field lookup picks the outer field, so {{.HarvesterNode}} renders the
+// override.
+type harvesterVars struct {
+	TemplateVars
+	HarvesterNode string
+}
 
 func (c *Config) SSHFiles(vars TemplateVars) ([]FileItem, error) {
 	var result []FileItem
@@ -194,6 +204,24 @@ func (c *Config) KubectlVMIQuery(vars TemplateVars) (string, error) {
 func (c *Config) OpensearchQueries(vars TemplateVars) ([]QueryItem, error) {
 	var result []QueryItem
 	for _, f := range c.OpenSearch.Queries {
+		// Queries referencing {{.HarvesterNode}} fan out across all
+		// HarvesterNodes discovered for the VM (e.g. before and after a
+		// failover). Each iteration writes to its own per-node subdir so
+		// outputs don't collide.
+		if len(vars.HarvesterNodes) > 1 && strings.Contains(f.Query, ".HarvesterNode") {
+			for _, node := range vars.HarvesterNodes {
+				rendered, err := render(f.Query, harvesterVars{TemplateVars: vars, HarvesterNode: node})
+				if err != nil {
+					return nil, err
+				}
+				result = append(result, QueryItem{
+					Name:  node + "/" + f.Name,
+					Index: f.Index,
+					Query: rendered,
+				})
+			}
+			continue
+		}
 		rendered, err := render(f.Query, vars)
 		if err != nil {
 			return nil, err
