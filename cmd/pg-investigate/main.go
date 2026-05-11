@@ -58,15 +58,38 @@ func main() {
 		fail("%v", err)
 	}
 
+	// Prompt for OpenSearch password once so --cluster mode (multiple targets)
+	// doesn't prompt per VM. Skip if all targets will skip OpenSearch.
+	var osPassword string
+	if !cli.SkipOpenSearch && anyTargetHasOpenSearch(cfg, targets) {
+		osPassword, err = opensearch.PromptPassword()
+		if err != nil {
+			fail("read password: %v", err)
+		}
+	}
+
 	for i, t := range targets {
 		if len(targets) > 1 {
 			fmt.Printf("\n=== [%d/%d] %s (%s) ===\n", i+1, len(targets), t.Vm, t.DC)
 		}
-		if err := investigate(t, cfg, incidentTime); err != nil {
+		if err := investigate(t, cfg, incidentTime, osPassword); err != nil {
 			fmt.Printf("Investigation failed for %s: %v\n", t.Vm, err)
 			os.Exit(1)
 		}
 	}
+}
+
+func anyTargetHasOpenSearch(cfg *config.Config, targets []target) bool {
+	for _, t := range targets {
+		dc, ok := cfg.Datacenters[t.DC]
+		if !ok {
+			continue
+		}
+		if len(dc.OpenSearchAddresses) > 0 || len(cfg.OpenSearch.Addresses) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func resolveTargets(cfg *config.Config) ([]target, error) {
@@ -128,35 +151,88 @@ func namespaceFromCluster(cluster string) (string, error) {
 	}
 }
 
-func investigate(t target, cfg *config.Config, incidentTime time.Time) error {
+// resolveHarvesterNodes returns the harvester nodes the VM lived on during the
+// time window. Resolution order:
+//  1. --harvester-node CLI override → single-node mode.
+//  2. OpenSearch discovery (if a client is available) → all historical nodes.
+//  3. kubectl VMI lookup → single-node, current placement.
+func resolveHarvesterNodes(t target, dc config.DCConfig, osClient *opensearch.Client, since, until string) ([]string, error) {
+	if cli.HarvesterNode != "" {
+		return []string{cli.HarvesterNode}, nil
+	}
+	if osClient != nil {
+		fmt.Printf("Discovering harvester nodes %s lived on...\n", t.Vm)
+		hosts, err := osClient.DiscoverHosts("harvester-*", "virt-launcher-"+t.Vm+"-", since, until)
+		if err != nil {
+			fmt.Printf("Discovery failed (%v); falling back to VMI lookup\n", err)
+		} else if len(hosts) > 0 {
+			return hosts, nil
+		}
+	}
+	if cli.SkipKubectl {
+		return nil, nil
+	}
+	fmt.Printf("Getting VMI info for %s...\n", t.Vm)
+	node, err := kubectl.GetVMINode(dc.KubeContext, t.Vm, t.Namespace)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get VMI node: %w", err)
+	}
+	if node == "" {
+		return nil, nil
+	}
+	return []string{node}, nil
+}
+
+func investigate(t target, cfg *config.Config, incidentTime time.Time, osPassword string) error {
 	dc, ok := cfg.Datacenters[t.DC]
 	if !ok {
 		return fmt.Errorf("unknown datacenter: %s", t.DC)
 	}
 
-	harvesterNode := cli.HarvesterNode
-	if harvesterNode == "" && !cli.SkipKubectl {
-		fmt.Printf("Getting VMI info for %s...\n", t.Vm)
+	since := incidentTime.Add(-cli.Window).Format(time.RFC3339)
+	until := incidentTime.Add(cli.Window).Format(time.RFC3339)
+
+	// Connect OpenSearch early so we can use it for harvester-node discovery
+	// before any collection runs. Reused for the queries phase below.
+	var osClient *opensearch.Client
+	osAddresses := dc.OpenSearchAddresses
+	if len(osAddresses) == 0 {
+		osAddresses = cfg.OpenSearch.Addresses
+	}
+	if !cli.SkipOpenSearch && len(osAddresses) > 0 {
 		var err error
-		harvesterNode, err = kubectl.GetVMINode(dc.KubeContext, t.Vm, t.Namespace)
+		osClient, err = opensearch.Connect(osAddresses, cfg.OpenSearch.User, osPassword, cfg.OpenSearch.CACert)
 		if err != nil {
-			return fmt.Errorf("failed to get VMI node: %w", err)
+			return fmt.Errorf("opensearch connect: %w", err)
 		}
 	}
-	if harvesterNode != "" {
-		fmt.Printf("VM is on harvester node: %s\n", harvesterNode)
+
+	harvesterNodes, err := resolveHarvesterNodes(t, dc, osClient, since, until)
+	if err != nil {
+		return err
+	}
+	if len(harvesterNodes) > 1 {
+		fmt.Printf("VM lived on harvester nodes: %s\n", strings.Join(harvesterNodes, ", "))
+	} else if len(harvesterNodes) == 1 {
+		fmt.Printf("VM is on harvester node: %s\n", harvesterNodes[0])
+	}
+
+	var primaryNode string
+	if len(harvesterNodes) > 0 {
+		primaryNode = harvesterNodes[0]
 	}
 
 	vars := config.TemplateVars{
-		IncidentTime:  incidentTime,
-		Since:         incidentTime.Add(-cli.Window).Format(time.RFC3339),
-		Until:         incidentTime.Add(cli.Window).Format(time.RFC3339),
-		PgVersion:     cli.PgVersion,
-		Host:          t.Host,
-		Vm:            t.Vm,
-		Namespace:     t.Namespace,
-		KubeContext:   dc.KubeContext,
-		HarvesterNode: harvesterNode,
+		IncidentTime:   incidentTime,
+		Since:          since,
+		Until:          until,
+		PgVersion:      cli.PgVersion,
+		Host:           t.Host,
+		Vm:             t.Vm,
+		Namespace:      t.Namespace,
+		KubeContext:    dc.KubeContext,
+		HarvesterNode:  primaryNode,
+		HarvesterNodes: harvesterNodes,
 	}
 
 	outputDir, err := output.BuildOutputPath(cli.Output, cli.Investigation, t.Vm)
@@ -194,23 +270,13 @@ func investigate(t target, cfg *config.Config, incidentTime time.Time) error {
 		}
 	}
 
-	if !cli.SkipOpenSearch {
-		osAddresses := dc.OpenSearchAddresses
-		if len(osAddresses) == 0 {
-			osAddresses = cfg.OpenSearch.Addresses
+	if osClient != nil {
+		queries, err := cfg.OpensearchQueries(vars)
+		if err != nil {
+			return fmt.Errorf("render opensearch queries: %w", err)
 		}
-		if len(osAddresses) > 0 {
-			osClient, err := opensearch.Connect(osAddresses, cfg.OpenSearch.User, cfg.OpenSearch.CACert)
-			if err != nil {
-				return fmt.Errorf("opensearch connect: %w", err)
-			}
-			queries, err := cfg.OpensearchQueries(vars)
-			if err != nil {
-				return fmt.Errorf("render opensearch queries: %w", err)
-			}
-			if err := collector.NewOpenSearch(osClient, queries).Collect(outputDir); err != nil {
-				return fmt.Errorf("opensearch collection: %w", err)
-			}
+		if err := collector.NewOpenSearch(osClient, queries).Collect(outputDir); err != nil {
+			return fmt.Errorf("opensearch collection: %w", err)
 		}
 	}
 

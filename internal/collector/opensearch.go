@@ -25,6 +25,9 @@ func (c *OpenSearchCollector) Collect(outputDir string) error {
 	for _, q := range c.queries {
 		fmt.Printf("Running OpenSearch query: %s\n", q.Name)
 		dest := filepath.Join(outputDir, q.Name)
+		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+			return err
+		}
 		f, err := os.Create(dest)
 		if err != nil {
 			return err
