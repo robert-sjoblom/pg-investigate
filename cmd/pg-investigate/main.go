@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/alecthomas/kong"
@@ -18,17 +19,25 @@ var cli struct {
 	Investigation  string        `short:"i" required:"" help:"Investigation name"`
 	Time           string        `short:"t" required:"" help:"Incident time"`
 	Output         string        `short:"o" default:"./investigation" help:"Output dir"`
-	Host           string        `name:"host" required:"" help:"SSH target"`
-	Vm             string        `name:"vm" required:"" help:"Harvester VM name"`
-	Namespace     string         `name:"ns" required:"" help:"Kubernetes namespace"`
+	Cluster        string        `long:"cluster" help:"Cluster name (e.g., prod-pg-f3c219); discovers all VMs across DCs and investigates each. Overrides --vm/--host/--dc."`
+	Host           string        `name:"host" help:"SSH target (required when --cluster is unset)"`
+	Vm             string        `name:"vm" help:"VM name (required when --cluster is unset)"`
+	Namespace      string        `name:"ns" help:"Kubernetes namespace (derived from --cluster env prefix if unset)"`
 	Insecure       bool          `long:"insecure" help:"Skip SSH host key verification"`
 	PgVersion      string        `long:"pg-version" required:"" help:"PostgreSQL version"`
 	Window         time.Duration `long:"window" short:"w" default:"10m" help:"Time window around incident"`
-	DC             string        `long:"dc" required:"" help:"Datacenter (sto1, sto2, sto3)"`
+	DC             string        `long:"dc" help:"Datacenter (sto1, sto2, sto3); required when --cluster is unset"`
 	HarvesterNode  string        `long:"harvester-node" help:"Override harvester node (skips VMI lookup; use for post-failover when VMI has moved)"`
-	SkipSSH        bool          `long:"skip-ssh" help:"Skip SSH collection (commands and files on the VM)"`
-	SkipKubectl    bool          `long:"skip-kubectl" help:"Skip kubectl collection (including VMI lookup; requires --harvester-node if any template uses it)"`
+	SkipSSH        bool          `long:"skip-ssh" help:"Skip SSH collection"`
+	SkipKubectl    bool          `long:"skip-kubectl" help:"Skip kubectl collection (including VMI lookup; requires --harvester-node if templates use it)"`
 	SkipOpenSearch bool          `long:"skip-opensearch" help:"Skip OpenSearch queries"`
+}
+
+type target struct {
+	Vm        string
+	Host      string
+	Namespace string
+	DC        string
 }
 
 func main() {
@@ -36,29 +45,102 @@ func main() {
 
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Println("Failed to load config:", err)
-		os.Exit(1)
+		fail("Failed to load config: %v", err)
 	}
 
 	incidentTime, err := time.ParseInLocation("2006-01-02 15:04", cli.Time, time.Local)
 	if err != nil {
-		fmt.Println("Invalid time format, expected: YYYY-MM-DD HH:MM")
-		os.Exit(1)
+		fail("Invalid time format, expected: YYYY-MM-DD HH:MM")
 	}
 
-	dc, ok := cfg.Datacenters[cli.DC]
+	targets, err := resolveTargets(cfg)
+	if err != nil {
+		fail("%v", err)
+	}
+
+	for i, t := range targets {
+		if len(targets) > 1 {
+			fmt.Printf("\n=== [%d/%d] %s (%s) ===\n", i+1, len(targets), t.Vm, t.DC)
+		}
+		if err := investigate(t, cfg, incidentTime); err != nil {
+			fmt.Printf("Investigation failed for %s: %v\n", t.Vm, err)
+			os.Exit(1)
+		}
+	}
+}
+
+func resolveTargets(cfg *config.Config) ([]target, error) {
+	if cli.Cluster == "" {
+		if cli.Vm == "" || cli.Host == "" || cli.DC == "" || cli.Namespace == "" {
+			return nil, fmt.Errorf("--vm, --host, --dc, --ns are required when --cluster is unset")
+		}
+		return []target{{Vm: cli.Vm, Host: cli.Host, Namespace: cli.Namespace, DC: cli.DC}}, nil
+	}
+
+	namespace := cli.Namespace
+	if namespace == "" {
+		ns, err := namespaceFromCluster(cli.Cluster)
+		if err != nil {
+			return nil, err
+		}
+		namespace = ns
+	}
+
+	dcByContext := map[string]string{}
+	for dc, dcCfg := range cfg.Datacenters {
+		dcByContext[dcCfg.KubeContext] = dc
+	}
+	vms, err := kubectl.FindClusterVMs(cli.Cluster, namespace, dcByContext)
+	if err != nil {
+		return nil, fmt.Errorf("cluster discovery failed: %w", err)
+	}
+	if len(vms) == 0 {
+		return nil, fmt.Errorf("no VMs found for cluster %s in namespace %s", cli.Cluster, namespace)
+	}
+
+	var out []target
+	for _, v := range vms {
+		out = append(out, target{
+			Vm:        v.Name,
+			Host:      fmt.Sprintf("%s.%s.fnox.se", v.Name, v.DC),
+			Namespace: v.Namespace,
+			DC:        v.DC,
+		})
+	}
+	return out, nil
+}
+
+// namespaceFromCluster derives the kubernetes namespace from the cluster name's env prefix.
+// "prod-pg-f3c219"      -> "db-prod001"
+// "infra-public-pg-foo" -> "db-infra-public001"
+func namespaceFromCluster(cluster string) (string, error) {
+	var env string
+	if strings.HasPrefix(cluster, "infra-public-") {
+		env = "infra-public"
+	} else if i := strings.Index(cluster, "-"); i > 0 {
+		env = cluster[:i]
+	}
+	switch env {
+	case "prod", "dev", "acce", "infra", "infra-public":
+		return fmt.Sprintf("db-%s001", env), nil
+	default:
+		return "", fmt.Errorf("cannot derive namespace from cluster %q; pass --ns explicitly", cluster)
+	}
+}
+
+func investigate(t target, cfg *config.Config, incidentTime time.Time) error {
+	dc, ok := cfg.Datacenters[t.DC]
 	if !ok {
-		fmt.Printf("Unknown datacenter: %s\n", cli.DC)
-		os.Exit(1)
+		return fmt.Errorf("unknown datacenter: %s", t.DC)
 	}
 
 	harvesterNode := cli.HarvesterNode
 	if harvesterNode == "" && !cli.SkipKubectl {
-		fmt.Printf("Getting VMI info for %s...\n", cli.Vm)
-		harvesterNode, err = kubectl.GetVMINode(dc.KubeContext, cli.Vm, cli.Namespace)
+		fmt.Printf("Getting VMI info for %s...\n", t.Vm)
+		var err error
+		harvesterNode, err = kubectl.GetVMINode(dc.KubeContext, t.Vm, t.Namespace)
 		if err != nil {
-			fmt.Println("Failed to get VMI node:", err)
-			os.Exit(1)
+			return fmt.Errorf("failed to get VMI node: %w", err)
 		}
 	}
 	if harvesterNode != "" {
@@ -70,52 +152,45 @@ func main() {
 		Since:         incidentTime.Add(-cli.Window).Format(time.RFC3339),
 		Until:         incidentTime.Add(cli.Window).Format(time.RFC3339),
 		PgVersion:     cli.PgVersion,
-		Host:          cli.Host,
-		Vm:            cli.Vm,
-		Namespace:     cli.Namespace,
+		Host:          t.Host,
+		Vm:            t.Vm,
+		Namespace:     t.Namespace,
 		KubeContext:   dc.KubeContext,
 		HarvesterNode: harvesterNode,
 	}
 
-	outputDir, err := output.BuildOutputPath(cli.Output, cli.Investigation, cli.Vm)
+	outputDir, err := output.BuildOutputPath(cli.Output, cli.Investigation, t.Vm)
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		return err
 	}
 
 	if !cli.SkipKubectl {
-		kubectlCommands, err := cfg.KubectlCommands(vars)
+		cmds, err := cfg.KubectlCommands(vars)
 		if err != nil {
-			fmt.Println("Failed to render kubectl commands:", err)
-			os.Exit(1)
+			return fmt.Errorf("render kubectl commands: %w", err)
 		}
-		if len(kubectlCommands) > 0 {
-			if err := collector.NewKubectl(kubectlCommands).Collect(outputDir); err != nil {
-				fmt.Println("Kubectl collection failed:", err)
-				os.Exit(1)
+		if len(cmds) > 0 {
+			if err := collector.NewKubectl(cmds).Collect(outputDir); err != nil {
+				return fmt.Errorf("kubectl collection: %w", err)
 			}
 		}
 	}
 
 	if !cli.SkipSSH {
-		commands, err := cfg.SSHCommands(vars)
+		cmds, err := cfg.SSHCommands(vars)
 		if err != nil {
-			fmt.Println("Failed to render commands:", err)
-			os.Exit(1)
+			return fmt.Errorf("render ssh commands: %w", err)
 		}
 		files, err := cfg.SSHFiles(vars)
 		if err != nil {
-			fmt.Println("Failed to render files:", err)
-			os.Exit(1)
+			return fmt.Errorf("render ssh files: %w", err)
 		}
-		client, err := ssh.Connect(cli.Host, cfg.SSH.User, cli.Insecure)
+		client, err := ssh.Connect(t.Host, cfg.SSH.User, cli.Insecure)
 		if err != nil {
-			fmt.Println("SSH connection failed:", err)
-			os.Exit(1)
+			return fmt.Errorf("ssh connect: %w", err)
 		}
-		if err := collector.NewSSH(client, commands, files).Collect(outputDir); err != nil {
-			fmt.Println("SSH collection failed:", err)
-			os.Exit(1)
+		if err := collector.NewSSH(client, cmds, files).Collect(outputDir); err != nil {
+			return fmt.Errorf("ssh collection: %w", err)
 		}
 	}
 
@@ -127,20 +202,23 @@ func main() {
 		if len(osAddresses) > 0 {
 			osClient, err := opensearch.Connect(osAddresses, cfg.OpenSearch.User, cfg.OpenSearch.CACert)
 			if err != nil {
-				fmt.Println("OpenSearch connection failed:", err)
-				os.Exit(1)
+				return fmt.Errorf("opensearch connect: %w", err)
 			}
 			queries, err := cfg.OpensearchQueries(vars)
 			if err != nil {
-				fmt.Println("Failed to render OpenSearch queries:", err)
-				os.Exit(1)
+				return fmt.Errorf("render opensearch queries: %w", err)
 			}
 			if err := collector.NewOpenSearch(osClient, queries).Collect(outputDir); err != nil {
-				fmt.Println("OpenSearch collection failed:", err)
-				os.Exit(1)
+				return fmt.Errorf("opensearch collection: %w", err)
 			}
 		}
 	}
 
 	fmt.Println("Done:", outputDir)
+	return nil
+}
+
+func fail(format string, args ...any) {
+	fmt.Printf(format+"\n", args...)
+	os.Exit(1)
 }
